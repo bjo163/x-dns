@@ -1,0 +1,78 @@
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
+use tokio::time::{timeout, Duration};
+
+use trust_dns_proto::op::{Message, MessageType, OpCode, Query};
+use trust_dns_proto::rr::{Record, RData};
+use trust_dns_proto::serialize::binary::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = "0.0.0.0:53".parse()?;
+    let socket = UdpSocket::bind(addr).await?;
+    println!("DNS server running on {}", addr);
+
+    let mut buf = [0u8; 512];
+
+    loop {
+        let (len, src) = socket.recv_from(&mut buf).await?;
+        let req = Message::from_vec(&buf[..len])?;
+        let query = req.queries().first().unwrap();
+        let name = query.name().to_string();
+
+        println!("Query: {}", name);
+
+        // hardcode domain tertentu
+        if name == "example.com." {
+            let mut resp = Message::new();
+            resp.set_id(req.id());
+            resp.set_message_type(MessageType::Response);
+            resp.set_op_code(OpCode::Query);
+            resp.set_authoritative(true);
+            resp.add_query(Query::query(query.name().clone(), query.query_type()));
+
+            let record = Record::from_rdata(
+                query.name().clone(),
+                60,
+                RData::A("1.2.3.4".parse().unwrap()),
+            );
+
+            resp.add_answer(record);
+
+            let mut resp_buf = Vec::with_capacity(512);
+            let mut encoder = BinEncoder::new(&mut resp_buf);
+            resp.emit(&mut encoder)?;
+            socket.send_to(&resp_buf, &src).await?;
+            continue;
+        }
+
+        // Forward ke upstream 8.8.8.8 (Google)
+        if let Some(resp) = forward_query(&buf[..len], "8.8.8.8:53").await {
+            let _ = socket.send_to(&resp, &src).await;
+            continue;
+        }
+
+        // Kalau gagal, forward ke Cloudflare 1.1.1.1
+        if let Some(resp) = forward_query(&buf[..len], "1.1.1.1:53").await {
+            let _ = socket.send_to(&resp, &src).await;
+            continue;
+        }
+    }
+}
+
+async fn forward_query(query_bytes: &[u8], upstream: &str) -> Option<Vec<u8>> {
+    let upstream_addr: SocketAddr = upstream.parse().ok()?;
+    let socket = UdpSocket::bind("0.0.0.0:0").await.ok()?;
+
+    socket.send_to(query_bytes, upstream_addr).await.ok()?;
+
+    let mut resp_buf = [0u8; 512];
+
+    let len = match timeout(Duration::from_secs(2), socket.recv_from(&mut resp_buf)).await {
+        Ok(Ok((len, _addr))) => len,
+        _ => return None,
+    };
+
+    Some(resp_buf[..len].to_vec())
+}
+
