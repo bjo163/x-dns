@@ -13,11 +13,47 @@ use trust_dns_proto::serialize::binary::*;
 
 use once_cell::sync::Lazy;
 
+use hyper::{Body, Request, Response, Server};
+use hyper::service::{make_service_fn, service_fn};
+use serde::Serialize;
+
+/* =========================
+   GLOBAL STATS
+========================= */
+#[derive(Default, Serialize)]
+struct Stats {
+    total_queries: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    errors: u64,
+    per_domain: HashMap<String, u64>,
+    per_client: HashMap<String, u64>,
+}
+
+impl Stats {
+    fn inc_domain(&mut self, domain: &str) {
+        let c = self.per_domain.entry(domain.to_string()).or_insert(0);
+        *c += 1;
+    }
+
+    fn inc_client(&mut self, ip: &str) {
+        let c = self.per_client.entry(ip.to_string()).or_insert(0);
+        *c += 1;
+    }
+}
+
+static STATS: Lazy<Mutex<Stats>> = Lazy::new(|| Mutex::new(Stats::default()));
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr: SocketAddr = "0.0.0.0:53".parse()?;
-    let socket = UdpSocket::bind(addr).await?;
-    println!("DNS server running on {}", addr);
+    let dns_addr: SocketAddr = "0.0.0.0:53".parse()?;
+    let socket = UdpSocket::bind(dns_addr).await?;
+    println!("DNS server running on {}", dns_addr);
+
+    // start http stats server in background
+    tokio::spawn(async {
+        start_http_stats().await.unwrap();
+    });
 
     let mut buf = [0u8; 512];
 
@@ -26,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("recv_from error: {}", e);
+                STATS.lock().unwrap().errors += 1;
                 continue;
             }
         };
@@ -35,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("parse error: {}", e);
+                STATS.lock().unwrap().errors += 1;
                 continue;
             }
         };
@@ -45,6 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let name = query.name().to_string();
+
+        // update stats
+        {
+            let mut st = STATS.lock().unwrap();
+            st.total_queries += 1;
+            st.inc_domain(&name);
+            st.inc_client(&src.ip().to_string());
+        }
 
         // rate limit per IP
         if !RATE_LIMIT.lock().unwrap().check(&src) {
@@ -57,8 +103,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 1) Cache check
         if let Some(resp) = CACHE.lock().unwrap().get(&name) {
             let _ = socket.send_to(&resp, &src).await;
+            STATS.lock().unwrap().cache_hits += 1;
             continue;
         }
+
+        STATS.lock().unwrap().cache_misses += 1;
 
         // 2) Hardcode domain tertentu
         if name == "example.com." {
@@ -84,6 +133,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // kalau gagal semua, ignore
         println!("Failed to resolve: {}", name);
     }
+}
+
+/* =========================
+   HTTP STATS SERVER
+========================= */
+async fn start_http_stats() -> Result<(), Box<dyn std::error::Error>> {
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+
+    let make_svc = make_service_fn(|_conn| async {
+        Ok::<_, hyper::Error>(service_fn(stats_handler))
+    });
+
+    let server = Server::bind(&addr).serve(make_svc);
+    println!("Stats HTTP running on http://{}", addr);
+
+    server.await?;
+    Ok(())
+}
+
+async fn stats_handler(_req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
+    let st = STATS.lock().unwrap();
+    let json = serde_json::to_string(&*st).unwrap();
+    Ok(Response::new(Body::from(json)))
 }
 
 /* =========================
@@ -204,7 +276,6 @@ async fn forward_query(query_bytes: &[u8], upstream: &str) -> Option<Vec<u8>> {
 
     Some(resp_buf[..len].to_vec())
 }
-
 
 /* =========================
    MODULE: RESPONSE BUILDER
