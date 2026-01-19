@@ -245,7 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
    HTTP STATS SERVER
 ========================= */
 async fn start_http_stats() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 4080));
 
     let make_svc = make_service_fn(|_conn| async {
         Ok::<_, hyper::Error>(service_fn(stats_handler))
