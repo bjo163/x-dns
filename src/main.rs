@@ -192,11 +192,19 @@ async fn forward_query(query_bytes: &[u8], upstream: &str) -> Option<Vec<u8>> {
 
     let len = match timeout(Duration::from_secs(2), socket.recv_from(&mut resp_buf)).await {
         Ok(Ok((len, _addr))) => len,
+        Ok(Err(e)) => {
+            // Windows: ignore ICMP port unreachable
+            if e.raw_os_error() == Some(10054) {
+                return None;
+            }
+            return None;
+        }
         _ => return None,
     };
 
     Some(resp_buf[..len].to_vec())
 }
+
 
 /* =========================
    MODULE: RESPONSE BUILDER
